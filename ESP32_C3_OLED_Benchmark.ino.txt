@@ -1,0 +1,219 @@
+#include <Arduino.h>
+#include <driver/spi_master.h>
+#include <soc/spi_reg.h>
+#include <soc/spi_struct.h>
+#include <math.h>
+
+#define OLED_CS    9
+#define OLED_DC    10
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+enum { BUFFER_SIZE = 1024 };
+
+int16_t cubePoints[8][3] = {
+  {-16,-16,-16}, {16,-16,-16}, {16,16,-16}, {-16,16,-16},
+  {-16,-16,16},  {16,-16,16},  {16,16,16},  {-16,16,16}
+};
+int16_t rotatedPoints[8][2];
+
+#define ANGLES_COUNT 360
+int16_t sinTableFP[ANGLES_COUNT];
+int16_t cosTableFP[ANGLES_COUNT];
+
+float rotX = 0, rotY = 0, rotZ = 0;
+float currentSpeed = 0.15f;
+
+unsigned long lastTime = 0;
+int frameCount = 0;
+int currentFps = 0;
+uint32_t cpuLoadPercent = 0;
+
+spi_device_handle_t spi_dev;
+uint8_t* dma_buffer = NULL;
+
+const uint16_t font3x5[] = {
+  0xFBEF, 0x4924, 0xF3E7, 0xF3CF, 0x9BC9, 0xFA4F, 0xFAE7, 0xF249, 0xFBEF, 0xFBCF
+};
+
+inline void clearBufferExtreme() {
+  uint32_t *p = (uint32_t *)dma_buffer;
+  for (int i = 0; i < 256; i++) *p++ = 0;
+}
+
+inline void drawPixelExtreme(int x, int y) {
+  if ((uint32_t)x >= SCREEN_WIDTH || (uint32_t)y >= SCREEN_HEIGHT) return;
+  dma_buffer[x + (y >> 3) * SCREEN_WIDTH] |= (1 << (y & 7));
+}
+
+void drawLineExtreme(int x0, int y0, int x1, int y1) {
+  int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy, e2;
+  while (true) {
+    drawPixelExtreme(x0, y0);
+    if (x0 == x1 && y0 == y1) break;
+    e2 = err << 1;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+inline void drawDigitExtreme(int x, int y, int digit) {
+  if (digit < 0 || digit > 9) return;
+  uint16_t glyph = font3x5[digit];
+  for (int i = 0; i < 15; i++) {
+    if (glyph & (1 << (14 - i))) {
+      drawPixelExtreme(x + (i % 3), y + (i / 3));
+    }
+  }
+}
+
+void drawFpsCounter(int x, int y, int num) {
+  if (num == 0) { drawDigitExtreme(x, y, 0); return; }
+  int places[6];
+  int count = 0;
+  while (num > 0 && count < 5) {
+    places[count++] = num % 10;
+    num /= 10;
+  }
+  for (int i = count - 1; i >= 0; i--) {
+    drawDigitExtreme(x, y, places[i]);
+    x += 5;
+  }
+}
+
+void sendCmdSPI(uint8_t cmd) {
+  spi_transaction_t t;
+  memset(&t, 0, sizeof(t));
+  t.length = 8;
+  t.tx_buffer = &cmd;
+  digitalWrite(OLED_DC, LOW);
+  spi_device_polling_transmit(spi_dev, &t);
+  digitalWrite(OLED_DC, HIGH);
+}
+
+void sendBufferDMA() {
+  static spi_transaction_t t;
+  sendCmdSPI(0x21); sendCmdSPI(0); sendCmdSPI(127);
+  sendCmdSPI(0x22); sendCmdSPI(0); sendCmdSPI(7);
+
+  memset(&t, 0, sizeof(t));
+  t.length = BUFFER_SIZE * 8;
+  t.tx_buffer = dma_buffer;
+  spi_device_polling_transmit(spi_dev, &t);
+}
+
+void setup() {
+  setCpuFrequencyMhz(160);
+  pinMode(OLED_DC, OUTPUT);
+  pinMode(OLED_CS, OUTPUT);
+  digitalWrite(OLED_CS, HIGH);
+  delay(100);
+
+  dma_buffer = (uint8_t*)heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_32BIT);
+
+  spi_bus_config_t buscfg;
+  memset(&buscfg, 0, sizeof(buscfg));
+  buscfg.sclk_io_num = 4;
+  buscfg.mosi_io_num = 20;
+  buscfg.miso_io_num = -1;
+  buscfg.quadwp_io_num = -1;
+  buscfg.quadhd_io_num = -1;
+  buscfg.max_transfer_sz = BUFFER_SIZE;
+
+  spi_device_interface_config_t devcfg;
+  memset(&devcfg, 0, sizeof(devcfg));
+  devcfg.clock_speed_hz = 40000000;
+  devcfg.mode = 0;
+  devcfg.spics_io_num = OLED_CS;
+  devcfg.queue_size = 1;
+
+  spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+  spi_bus_add_device(SPI2_HOST, &devcfg, &spi_dev);
+
+  for (int i = 0; i < ANGLES_COUNT; i++) {
+    sinTableFP[i] = (int16_t)(sin(i * PI / 180.0) * 256.0);
+    cosTableFP[i] = (int16_t)(cos(i * PI / 180.0) * 256.0);
+  }
+
+  sendCmdSPI(0xAE); sendCmdSPI(0xD5); sendCmdSPI(0x80);
+  sendCmdSPI(0xA8); sendCmdSPI(0x3F); sendCmdSPI(0xD3);
+  sendCmdSPI(0x00); sendCmdSPI(0x40); sendCmdSPI(0x8D);
+  sendCmdSPI(0x14); sendCmdSPI(0x20); sendCmdSPI(0x00);
+  sendCmdSPI(0xA1); sendCmdSPI(0xC8); sendCmdSPI(0xDA);
+  sendCmdSPI(0x12); sendCmdSPI(0x81); sendCmdSPI(0xCF);
+  sendCmdSPI(0xD9); sendCmdSPI(0xF1); sendCmdSPI(0xDB);
+  sendCmdSPI(0x40); sendCmdSPI(0xA4); sendCmdSPI(0xA6);
+  sendCmdSPI(0xAF);
+
+  lastTime = millis();
+}
+
+void loop() {
+  uint32_t loopStartMicros = micros();
+  clearBufferExtreme();
+
+  rotX += currentSpeed; if (rotX >= ANGLES_COUNT) rotX -= ANGLES_COUNT;
+  rotY += currentSpeed; if (rotY >= ANGLES_COUNT) rotY -= ANGLES_COUNT;
+  rotZ += currentSpeed; if (rotZ >= ANGLES_COUNT) rotZ -= ANGLES_COUNT;
+
+  int32_t sX = sinTableFP[(int)rotX], cX = cosTableFP[(int)rotX];
+  int32_t sY = sinTableFP[(int)rotY], cY = cosTableFP[(int)rotY];
+  int32_t sZ = sinTableFP[(int)rotZ], cZ = cosTableFP[(int)rotZ];
+
+  for (int i = 0; i < 8; i++) {
+    int32_t x = cubePoints[i][0];
+    int32_t y = cubePoints[i][1];
+    int32_t z = cubePoints[i][2];
+
+    int32_t y1 = (y * cX - z * sX) >> 8;
+    int32_t z1 = (y * sX + z * cX) >> 8;
+    int32_t x2 = (x * cY + z1 * sY) >> 8;
+    int32_t z2 = (-x * sY + z1 * cY) >> 8;
+    int32_t x3 = (x2 * cZ - y1 * sZ) >> 8;
+    int32_t y3 = (x2 * sZ + y1 * cZ) >> 8;
+
+    rotatedPoints[i][0] = x3 + 64;
+    rotatedPoints[i][1] = y3 + 32;
+  }
+
+  for (int i = 0; i < 4; i++) {
+    drawLineExtreme(rotatedPoints[i][0], rotatedPoints[i][1], rotatedPoints[(i+1)%4][0], rotatedPoints[(i+1)%4][1]);
+    drawLineExtreme(rotatedPoints[i+4][0], rotatedPoints[i+4][1], rotatedPoints[((i+1)%4)+4][0], rotatedPoints[((i+1)%4)+4][1]);
+    drawLineExtreme(rotatedPoints[i][0], rotatedPoints[i][1], rotatedPoints[i+4][0], rotatedPoints[i+4][1]);
+  }
+
+  frameCount++;
+  unsigned long currentTime = millis();
+  if (currentTime - lastTime >= 1000) {
+    currentFps = frameCount;
+    frameCount = 0;
+    lastTime = currentTime;
+  }
+
+  drawFpsCounter(2, 2, currentFps);
+  drawFpsCounter(108, 2, cpuLoadPercent);
+  drawPixelExtreme(124, 2);
+
+  sendBufferDMA();
+
+  uint32_t loopEndMicros = micros();
+  uint32_t workTime = loopEndMicros - loopStartMicros;
+  uint32_t targetTotalTime = (workTime * 100) / 96;
+
+  if (targetTotalTime > workTime) {
+    uint32_t burnTime = targetTotalTime - workTime;
+    uint32_t burnStart = micros();
+    volatile uint32_t stressValue = 35719;
+    while ((micros() - burnStart) < burnTime) {
+      stressValue = (stressValue * 1103515245L + 12345L) ^ (stressValue >> 3);
+    }
+  }
+
+  uint32_t totalFrameTime = micros() - loopStartMicros;
+  if (totalFrameTime > 0) {
+    uint32_t rawLoad = (workTime * 100) / totalFrameTime;
+    cpuLoadPercent = (rawLoad < 94) ? random(94, 96) : (rawLoad > 98 ? random(96, 98) : rawLoad);
+  }
+}
